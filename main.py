@@ -266,6 +266,197 @@ def read_pcap(filename):
     print(" We can now parse Ethernet headers.")
 
 
+    # ============================================================
+# NetScope - Network Packet Analyzer
+# Day 3: Parse IPv4 headers - extract IP addresses
+# ============================================================
+#
+# What is an IPv4 Header?
+# After the Ethernet header comes the IP header.
+# It tells us WHERE the packet is going on the internet.
+#
+# IPv4 Header structure (minimum 20 bytes):
+#   Byte 0     : Version (4 bits) + Header Length (4 bits)
+#   Byte 1     : DSCP/ECN (service type)
+#   Bytes 2-3  : Total Length
+#   Bytes 4-5  : Identification
+#   Bytes 6-7  : Flags + Fragment Offset
+#   Byte 8     : TTL (Time To Live - how many hops before discarded)
+#   Byte 9     : Protocol (6=TCP, 17=UDP, 1=ICMP)
+#   Bytes 10-11: Header Checksum
+#   Bytes 12-15: Source IP Address
+#   Bytes 16-19: Destination IP Address
+#
+# Protocol numbers:
+#   1  = ICMP (ping)
+#   6  = TCP  (web, email, etc.)
+#   17 = UDP  (DNS, video streaming, etc.)
+
+import struct
+import socket  # socket.inet_ntoa converts bytes to "192.168.1.1" format
+import sys
+
+
+# ── Ethernet Header Parser (from Day 2) ───────────────────────────────────
+def parse_ethernet(data):
+    if len(data) < 14:
+        return None, None, None, 0
+    dst_mac    = ':'.join(f'{b:02x}' for b in data[0:6])
+    src_mac    = ':'.join(f'{b:02x}' for b in data[6:12])
+    ether_type = struct.unpack('!H', data[12:14])[0]
+    return dst_mac, src_mac, ether_type, 14
+
+
+# ── NEW: IPv4 Header Parser ────────────────────────────────────────────────
+def parse_ipv4(data, offset):
+    """
+    Parse IPv4 header starting at 'offset' in the data.
+
+    offset = position right after the Ethernet header (usually 14)
+
+    Returns: (src_ip, dst_ip, protocol, ttl, ip_header_length)
+    """
+    if len(data) < offset + 20:
+        return None, None, None, 0, 0
+
+    # Byte 0: Version (top 4 bits) + IHL (bottom 4 bits)
+    # IHL = Internet Header Length in 32-bit words
+    # Multiply by 4 to get bytes (e.g., IHL=5 means 20 bytes)
+    version_ihl    = data[offset]
+    version        = (version_ihl >> 4) & 0xF   # top 4 bits
+    ihl            = (version_ihl & 0xF) * 4     # bottom 4 bits × 4
+
+    if version != 4:
+        return None, None, None, 0, 0  # not IPv4
+
+    # Byte 8: TTL - each router decrements this by 1
+    # When it reaches 0, the packet is dropped (prevents infinite loops)
+    ttl = data[offset + 8]
+
+    # Byte 9: Protocol number
+    protocol = data[offset + 9]
+
+    # Bytes 12-15: Source IP (4 bytes)
+    src_ip = socket.inet_ntoa(data[offset + 12 : offset + 16])
+
+    # Bytes 16-19: Destination IP (4 bytes)
+    dst_ip = socket.inet_ntoa(data[offset + 16 : offset + 20])
+
+    return src_ip, dst_ip, protocol, ttl, ihl
+
+
+def protocol_name(proto):
+    """Convert protocol number to name."""
+    protocols = {
+        1:  'ICMP',
+        6:  'TCP',
+        17: 'UDP',
+    }
+    return protocols.get(proto, f'OTHER({proto})')
+
+
+# ── PCAP Reader ────────────────────────────────────────────────────────────
+def read_pcap(filename):
+    print(f"Opening file: {filename}")
+    print("-" * 60)
+
+    try:
+        f = open(filename, 'rb')
+    except FileNotFoundError:
+        print(f"ERROR: File '{filename}' not found!")
+        return
+
+    global_header = f.read(24)
+    magic = struct.unpack('<I', global_header[0:4])[0]
+    if magic != 0xa1b2c3d4:
+        print("ERROR: Not a valid PCAP file!")
+        f.close()
+        return
+
+    print("PCAP file opened successfully!")
+    print("-" * 60)
+
+    packet_count = 0
+    tcp_count    = 0
+    udp_count    = 0
+    icmp_count   = 0
+    other_count  = 0
+
+    # Track unique IP addresses and conversations
+    src_ips      = set()
+    dst_ips      = set()
+
+    while True:
+        pkt_header = f.read(16)
+        if len(pkt_header) < 16:
+            break
+
+        ts_sec, ts_usec, incl_len, orig_len = struct.unpack('<IIII', pkt_header)
+        data = f.read(incl_len)
+        packet_count += 1
+
+        # Step 1: Parse Ethernet header
+        dst_mac, src_mac, ether_type, eth_len = parse_ethernet(data)
+
+        # Step 2: Only process IPv4 packets (EtherType 0x0800)
+        if ether_type != 0x0800:
+            continue
+
+        # Step 3: Parse IP header (starts right after Ethernet = offset 14)
+        src_ip, dst_ip, protocol, ttl, ip_hdr_len = parse_ipv4(data, eth_len)
+
+        if src_ip is None:
+            continue
+
+        # Track IPs
+        src_ips.add(src_ip)
+        dst_ips.add(dst_ip)
+
+        # Count protocols
+        if protocol == 6:
+            tcp_count += 1
+        elif protocol == 17:
+            udp_count += 1
+        elif protocol == 1:
+            icmp_count += 1
+        else:
+            other_count += 1
+
+        # Print first 5 packets in detail
+        if packet_count <= 5:
+            print(f"Packet #{packet_count}:")
+            print(f"  Source IP       : {src_ip}")
+            print(f"  Destination IP  : {dst_ip}")
+            print(f"  Protocol        : {protocol_name(protocol)}")
+            print(f"  TTL             : {ttl}")
+            print(f"  IP header size  : {ip_hdr_len} bytes")
+            print()
+
+    f.close()
+
+    # Print summary
+    all_ips = src_ips | dst_ips  # union of all IP addresses seen
+    print("-" * 60)
+    print("SUMMARY")
+    print("-" * 60)
+    print(f"Total packets     : {packet_count}")
+    print(f"TCP packets       : {tcp_count}")
+    print(f"UDP packets       : {udp_count}")
+    print(f"ICMP packets      : {icmp_count}")
+    print(f"Other packets     : {other_count}")
+    print(f"Unique IPs seen   : {len(all_ips)}")
+    print()
+    print("IP Addresses found:")
+    for ip in sorted(all_ips):
+        print(f"  {ip}")
+    print("-" * 60)
+    print("Day 3 complete! We can now extract IP addresses from packets.")
+
+
+
+
+
+
 # ── Entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     filename = sys.argv[1] if len(sys.argv) > 1 else "sample.pcap"
