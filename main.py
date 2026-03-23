@@ -463,3 +463,257 @@ if __name__ == "__main__":
     read_pcap(filename)
 
 
+# ============================================================
+# NetScope - Network Packet Analyzer
+# 
+# ============================================================
+#
+# What are ports?
+# An IP address identifies a computer.
+# A port number identifies a specific application on that computer.
+#
+# Think of it like an apartment building:
+#   IP address = building address
+#   Port number = apartment number
+#
+# Common port numbers:
+#   80   = HTTP  (normal websites)
+#   443  = HTTPS (secure websites)
+#   53   = DNS   (domain name lookup)
+#   22   = SSH   (remote login)
+#   25   = SMTP  (email sending)
+#
+# TCP Header structure (minimum 20 bytes):
+#   Bytes 0-1  : Source Port
+#   Bytes 2-3  : Destination Port
+#   Bytes 4-7  : Sequence Number
+#   Bytes 8-11 : Acknowledgment Number
+#   Byte 12    : Data Offset (header length in 32-bit words)
+#   Byte 13    : Flags (SYN, ACK, FIN, RST, PSH, URG)
+#   Bytes 14-15: Window Size
+#   Bytes 16-17: Checksum
+#
+# UDP Header structure (always exactly 8 bytes - simpler than TCP):
+#   Bytes 0-1  : Source Port
+#   Bytes 2-3  : Destination Port
+#   Bytes 4-5  : Length
+#   Bytes 6-7  : Checksum
+
+import struct
+import socket
+import sys
+from collections import Counter  # Counter counts how many times things appear
+
+
+# ── Parsers from previous days ─────────────────────────────────────────────
+def parse_ethernet(data):
+    if len(data) < 14:
+        return None, None, None, 0
+    dst_mac    = ':'.join(f'{b:02x}' for b in data[0:6])
+    src_mac    = ':'.join(f'{b:02x}' for b in data[6:12])
+    ether_type = struct.unpack('!H', data[12:14])[0]
+    return dst_mac, src_mac, ether_type, 14
+
+
+def parse_ipv4(data, offset):
+    if len(data) < offset + 20:
+        return None, None, None, 0, 0
+    version_ihl = data[offset]
+    ihl         = (version_ihl & 0xF) * 4
+    if (version_ihl >> 4) != 4:
+        return None, None, None, 0, 0
+    ttl      = data[offset + 8]
+    protocol = data[offset + 9]
+    src_ip   = socket.inet_ntoa(data[offset + 12 : offset + 16])
+    dst_ip   = socket.inet_ntoa(data[offset + 16 : offset + 20])
+    return src_ip, dst_ip, protocol, ttl, ihl
+
+
+# ── NEW: TCP Header Parser ─────────────────────────────────────────────────
+def parse_tcp(data, offset):
+    """
+    Parse TCP header starting at 'offset'.
+    Returns: (src_port, dst_port, flags, tcp_header_length, payload)
+    """
+    if len(data) < offset + 20:
+        return None, None, 0, 0, b''
+
+    src_port = struct.unpack('!H', data[offset:offset+2])[0]
+    dst_port = struct.unpack('!H', data[offset+2:offset+4])[0]
+
+    # Byte 12: Data Offset = how long the TCP header is (in 32-bit words)
+    data_offset    = (data[offset + 12] >> 4) * 4  # convert to bytes
+    flags          = data[offset + 13]              # SYN, ACK, FIN, etc.
+
+    # Everything after the TCP header is the payload (application data)
+    payload = data[offset + data_offset:]
+
+    return src_port, dst_port, flags, data_offset, payload
+
+
+# ── NEW: UDP Header Parser ─────────────────────────────────────────────────
+def parse_udp(data, offset):
+    """
+    Parse UDP header starting at 'offset'.
+    UDP is simpler than TCP - just 8 bytes.
+    Returns: (src_port, dst_port, payload)
+    """
+    if len(data) < offset + 8:
+        return None, None, b''
+
+    src_port = struct.unpack('!H', data[offset:offset+2])[0]
+    dst_port = struct.unpack('!H', data[offset+2:offset+4])[0]
+    payload  = data[offset + 8:]  # payload starts right after 8-byte header
+
+    return src_port, dst_port, payload
+
+
+# ── NEW: TCP Flags Decoder ─────────────────────────────────────────────────
+def decode_tcp_flags(flags):
+    """
+    TCP flags are bits in byte 13 of the TCP header.
+    Each bit has a meaning:
+      Bit 0 (0x01): FIN - connection finish
+      Bit 1 (0x02): SYN - connection start
+      Bit 2 (0x04): RST - reset (force close)
+      Bit 3 (0x08): PSH - push data now
+      Bit 4 (0x10): ACK - acknowledgment
+      Bit 5 (0x20): URG - urgent data
+    """
+    flag_names = []
+    if flags & 0x02: flag_names.append('SYN')
+    if flags & 0x10: flag_names.append('ACK')
+    if flags & 0x01: flag_names.append('FIN')
+    if flags & 0x04: flag_names.append('RST')
+    if flags & 0x08: flag_names.append('PSH')
+    if flags & 0x20: flag_names.append('URG')
+    return ','.join(flag_names) if flag_names else 'NONE'
+
+
+def port_to_service(port):
+    """Map well-known port numbers to service names."""
+    services = {
+        80:   'HTTP',
+        443:  'HTTPS',
+        53:   'DNS',
+        22:   'SSH',
+        25:   'SMTP',
+        110:  'POP3',
+        143:  'IMAP',
+        21:   'FTP',
+        3306: 'MySQL',
+        5432: 'PostgreSQL',
+        6379: 'Redis',
+        8080: 'HTTP-Alt',
+        8443: 'HTTPS-Alt',
+    }
+    return services.get(port, str(port))
+
+
+# ── PCAP Reader ────────────────────────────────────────────────────────────
+def read_pcap(filename):
+    print(f"Opening file: {filename}")
+    print("-" * 65)
+
+    try:
+        f = open(filename, 'rb')
+    except FileNotFoundError:
+        print(f"ERROR: File '{filename}' not found!")
+        return
+
+    global_header = f.read(24)
+    if struct.unpack('<I', global_header[0:4])[0] != 0xa1b2c3d4:
+        print("ERROR: Not a valid PCAP file!")
+        f.close()
+        return
+
+    print("PCAP opened! Now parsing TCP/UDP ports...\n")
+
+    packet_count  = 0
+    port_counter  = Counter()   # counts how often each port is used
+    syn_count     = 0           # new TCP connections started
+    connections   = set()       # unique (src_ip:port -> dst_ip:port) pairs
+
+    while True:
+        pkt_header = f.read(16)
+        if len(pkt_header) < 16:
+            break
+
+        ts_sec, ts_usec, incl_len, orig_len = struct.unpack('<IIII', pkt_header)
+        data = f.read(incl_len)
+        packet_count += 1
+
+        # Parse Ethernet
+        _, _, ether_type, eth_len = parse_ethernet(data)
+        if ether_type != 0x0800:
+            continue
+
+        # Parse IPv4
+        src_ip, dst_ip, protocol, ttl, ip_len = parse_ipv4(data, eth_len)
+        if src_ip is None:
+            continue
+
+        transport_offset = eth_len + ip_len  # where TCP/UDP starts
+
+        # Parse TCP
+        if protocol == 6:
+            src_port, dst_port, flags, tcp_len, payload = parse_tcp(data, transport_offset)
+            if src_port is None:
+                continue
+
+            port_counter[dst_port] += 1
+
+            # SYN flag set = new connection being established
+            if flags & 0x02 and not (flags & 0x10):
+                syn_count += 1
+
+            # Track unique connections
+            conn = (src_ip, src_port, dst_ip, dst_port)
+            connections.add(conn)
+
+            # Print first 5 TCP packets
+            if packet_count <= 5:
+                print(f"Packet #{packet_count} [TCP]")
+                print(f"  {src_ip}:{src_port}  →  {dst_ip}:{port_to_service(dst_port)}")
+                print(f"  Flags   : {decode_tcp_flags(flags)}")
+                print(f"  Payload : {len(payload)} bytes")
+                print()
+
+        # Parse UDP
+        elif protocol == 17:
+            src_port, dst_port, payload = parse_udp(data, transport_offset)
+            if src_port is None:
+                continue
+
+            port_counter[dst_port] += 1
+
+            if packet_count <= 5:
+                print(f"Packet #{packet_count} [UDP]")
+                print(f"  {src_ip}:{src_port}  →  {dst_ip}:{port_to_service(dst_port)}")
+                print(f"  Payload : {len(payload)} bytes")
+                print()
+
+    f.close()
+
+    # Print port usage summary
+    print("-" * 65)
+    print("SUMMARY")
+    print("-" * 65)
+    print(f"Total packets        : {packet_count}")
+    print(f"New TCP connections  : {syn_count}")
+    print(f"Unique connections   : {len(connections)}")
+    print()
+    print("Top 10 destination ports:")
+    for port, count in port_counter.most_common(10):
+        bar = '█' * min(count, 30)
+        print(f"  Port {port_to_service(port):<12} : {count:>4}  {bar}")
+    print("-" * 65)
+    print("Day 4 complete! We can now extract port numbers from packets.")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    filename = sys.argv[1] if len(sys.argv) > 1 else "sample.pcap"
+    read_pcap(filename)
+
+
